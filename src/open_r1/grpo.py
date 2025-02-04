@@ -33,6 +33,21 @@ from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_c
 
 logger = logging.getLogger(__name__)
 
+def make_prefix(dp, template_type):
+    target = dp['target']
+    numbers = dp['nums']
+    # NOTE: also need to change reward_score/countdown.py
+    if template_type == 'base':
+        """This works for any base model"""
+        prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+User: Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.
+Assistant: Let me solve this step by step.
+<think>"""
+    elif template_type == 'qwen-instruct':
+        """This works for Qwen Instruct Models"""
+        prefix = f"""<|im_start|>system\nYou are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer.<|im_end|>\n<|im_start|>user\n Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>"""
+    return prefix
+
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -87,17 +102,25 @@ def accuracy_reward(completions, solution, **kwargs):
 
     return rewards
 
+from open_r1.countdown import compute_score
+def accuracy_reward2(prompts, completions, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    rewards = []
+    for content, target, num in zip(completions, kwargs['target'], kwargs['nums']):
+        rewards.append(compute_score(content, {'target': target, 'numbers': num}))
+
+    return rewards
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content) for content in completion_contents]
+    #pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+    pattern = r".*?</think><answer>.*?</answer>$"
+    matches = [re.match(pattern, content) for content in completions]
     return [1.0 if match else 0.0 for match in matches]
 
 
 reward_funcs_registry = {
-    "accuracy": accuracy_reward,
+    "accuracy": accuracy_reward2,
     "format": format_reward,
 }
 
@@ -145,7 +168,12 @@ def main(script_args, training_args, model_args):
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config, split='train')
+    train, test = load_dataset(
+        script_args.dataset_name, name=script_args.dataset_config, split=['train[:327680]','train[-1024:]']
+    )
+    from datasets import DatasetDict
+    dataset = DatasetDict({'train': train, 'test': test})
 
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
@@ -153,10 +181,12 @@ def main(script_args, training_args, model_args):
     # Format into conversation
     def make_conversation(example):
         return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
-            ],
+            # "prompt": [
+            #     # {"role": "system", "content": SYSTEM_PROMPT},
+            #     # {"role": "user", "content": example["problem"]},
+            #     {"role": "user", "content": make_prefix(example, 'base')},
+            # ],
+            "prompt": make_prefix(example, 'base')
         }
 
     dataset = dataset.map(make_conversation)
