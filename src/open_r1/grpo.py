@@ -24,30 +24,17 @@ from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
-from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
 from open_r1.configs import GRPOConfig
 from open_r1.utils.callbacks import get_callbacks
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
+try:
+    from latex2sympy2_extended import NormalizationConfig
+    from math_verify import LatexExtractionConfig, parse, verify
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
-
-def make_prefix(dp, template_type):
-    target = dp['target']
-    numbers = dp['nums']
-    # NOTE: also need to change reward_score/countdown.py
-    if template_type == 'base':
-        """This works for any base model"""
-        prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
-User: Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.
-Assistant: Let me solve this step by step.
-<think>"""
-    elif template_type == 'qwen-instruct':
-        """This works for Qwen Instruct Models"""
-        prefix = f"""<|im_start|>system\nYou are a helpful assistant. You first thinks about the reasoning process in the mind and then provides the user with the answer.<|im_end|>\n<|im_start|>user\n Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.<|im_end|>\n<|im_start|>assistant\nLet me solve this step by step.\n<think>"""
-    return prefix
-
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -62,6 +49,11 @@ class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format"],
         metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
+    )
+
+    custom_task: str = field(
+        default=None,
+        metadata={"help": "Pass name to custom task"}
     )
 
 
@@ -102,25 +94,16 @@ def accuracy_reward(completions, solution, **kwargs):
 
     return rewards
 
-from open_r1.countdown import compute_score
-def accuracy_reward2(prompts, completions, **kwargs):
-    """Reward function that checks if the completion is the same as the ground truth."""
-    rewards = []
-    for content, target, num in zip(completions, kwargs['target'], kwargs['nums']):
-        rewards.append(compute_score(content, {'target': target, 'numbers': num}))
-
-    return rewards
-
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    #pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-    pattern = r".*?</think><answer>.*?</answer>$"
-    matches = [re.match(pattern, content) for content in completions]
+    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [re.match(pattern, content) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 
 reward_funcs_registry = {
-    "accuracy": accuracy_reward2,
+    "accuracy": accuracy_reward,
     "format": format_reward,
 }
 
@@ -130,7 +113,6 @@ SYSTEM_PROMPT = (
     "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
-
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -167,35 +149,35 @@ def main(script_args, training_args, model_args):
     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
-    # Load the dataset
-    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config, split='train')
-    train, test = load_dataset(
-        script_args.dataset_name, name=script_args.dataset_config, split=['train[:327680]','train[-1024:]']
-    )
-    from datasets import DatasetDict
-    dataset = DatasetDict({'train': train, 'test': test})
+    if script_args.custom_task:
+        import open_r1.custom_tasks as tasks
+        custom_task = getattr(tasks, script_args.custom_task)
+        dataset = custom_task.load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+        dataset = dataset.map(custom_task.make_conversation)
+        reward_funcs = [
+            custom_task.reward_funcs_registry[func] for func in script_args.reward_funcs
+        ]
+    else:
+        # Format into conversation
+        def make_conversation(example):
+            return {
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": example["problem"]},
+                ],
+            }
+        # Load the dataset
+        dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+        dataset = dataset.map(make_conversation)
+        reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
 
-    # Get reward functions
-    reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-
-    # Format into conversation
-    def make_conversation(example):
-        return {
-            # "prompt": [
-            #     # {"role": "system", "content": SYSTEM_PROMPT},
-            #     # {"role": "user", "content": example["problem"]},
-            #     {"role": "user", "content": make_prefix(example, 'base')},
-            # ],
-            "prompt": make_prefix(example, 'base')
-        }
-
-    dataset = dataset.map(make_conversation)
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
-    ####
-    # adjust tokenizer if needed missing stuff
+    #############################
+    # Adjust tokenizer if needed
+    #############################
     processing_class = None
     from transformers import AutoTokenizer, AutoConfig
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)

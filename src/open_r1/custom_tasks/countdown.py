@@ -2,17 +2,11 @@ import re
 import random
 import ast
 import operator
+from datasets import load_dataset as load_dataset_old, DatasetDict
 
-
+# taken from TinyZero
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
-    # Remove everything before the first "Assistant:"
-    # if "Assistant:" in solution_str:
-    #     solution_str = solution_str.split("Assistant:", 1)[1]
-    # elif "<|im_start|>assistant" in solution_str:
-    #     solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
-    # else:
-    #     return None
     solution_str = solution_str.split('\n')[-1]
 
     answer_pattern = r'<answer>(.*?)</answer>'
@@ -23,7 +17,6 @@ def extract_solution(solution_str):
     else:
         final_answer = None
     return final_answer
-
 
 def validate_equation(equation_str, available_numbers):
     """Validate that equation only uses available numbers and each number once."""
@@ -40,7 +33,6 @@ def validate_equation(equation_str, available_numbers):
     except:
         return False
 
-
 def evaluate_equation(equation_str):
     """Safely evaluate the arithmetic equation using eval() with precautions."""
     try:
@@ -56,6 +48,7 @@ def evaluate_equation(equation_str):
         return None
 
 
+# this function does both scoring, and assigning a basic format score
 def compute_score(solution_str, ground_truth, method='strict', format_score=0.1, score=1.):
     """The scoring function for countdown task.
     
@@ -68,12 +61,9 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
     """
     target = ground_truth['target']
     numbers = ground_truth['numbers']
-    # import pdb; pdb.set_trace()
     
     equation = extract_solution(solution_str=solution_str)
-    # do_print = random.randint(1, 64) == 1
-    do_print = False
-    # do_print = True
+    do_print = False # random.randint(1, 64) == 1
     
     if do_print:
         print(f"--------------------------------")
@@ -112,3 +102,44 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
         if do_print:
             print(f"Error evaluating equation")
         return format_score
+
+# custom reward
+def accuracy_reward(prompts, completions, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    rewards = []
+    for content, target, num in zip(completions, kwargs['target'], kwargs['nums']):
+        rewards.append(compute_score(content, {'target': target, 'numbers': num}))
+
+    return rewards
+
+# need to figure out how to use the chat template for instruct models
+def make_prefix(dp):
+    target = dp['target']
+    numbers = dp['nums']
+    # """This works for any base model"""
+    prefix = f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer.
+User: Using the numbers {numbers}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.
+Assistant: Let me solve this step by step.
+<think>"""
+    return prefix
+
+# custom process_data
+def make_conversation(example):
+    # for now.. only support base model with no conversation
+    return {
+        "prompt": make_prefix(example)
+    }
+
+# custom
+def load_dataset(*args, **kwargs):
+    train, test = load_dataset_old(
+        *args, **kwargs,
+        split=['train[:327680]','train[-1024:]']
+    )
+    return DatasetDict({'train': train, 'test': test})
+
+# custom
+reward_funcs_registry = {
+    'accuracy': accuracy_reward
+}
+

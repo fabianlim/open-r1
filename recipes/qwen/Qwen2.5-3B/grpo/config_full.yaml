@@ -3,16 +3,10 @@ model_name_or_path: Qwen/Qwen2.5-3B
 model_revision: main
 torch_dtype: bfloat16
 
-# Data training arguments
-# dataset_name: AI-MO/NuminaMath-TIR
-# dataset_configs:
-# - all
-
 dataset_name: Jiayi-Pan/Countdown-Tasks-3to4
 dataset_configs:
 - train
-# Num processes is less by 1 as vLLM is using 1 GPU
-num_processes: 1
+custom_task: countdown
 
 # GRPO trainer config
 bf16: true
