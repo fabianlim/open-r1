@@ -194,6 +194,19 @@ def main(script_args, training_args, model_args):
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
+    ####
+    # adjust tokenizer if needed missing stuff
+    processing_class = None
+    from transformers import AutoTokenizer, AutoConfig
+    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    for token_prefix in ['eos', 'pad']:
+        _token_id_name = f'{token_prefix}_token_id'
+        if not hasattr(tokenizer, _token_id_name):
+            _id = getattr(config, _token_id_name)
+            setattr(tokenizer, _token_id_name, _id) 
+            processing_class = tokenizer
+
     #############################
     # Initialize the GRPO trainer
     #############################
@@ -204,6 +217,7 @@ def main(script_args, training_args, model_args):
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
+        processing_class=processing_class,
         callbacks=get_callbacks(training_args, model_args),
     )
 
