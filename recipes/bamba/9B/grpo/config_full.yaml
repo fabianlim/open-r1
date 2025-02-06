@@ -1,0 +1,65 @@
+# Model arguments
+model_name_or_path: ibm-ai-platform/Bamba-9B
+model_revision: main
+model_init_kwargs:
+  use_flash_attention_2: true
+  torch_dtype: bfloat16
+
+dataset_name: Jiayi-Pan/Countdown-Tasks-3to4
+dataset_configs:
+- train
+custom_task: countdown
+
+# GRPO trainer config
+# using FSDP and not many nodes, so just turn off
+# mixed precision to prevent upcasting
+# bf16: true
+use_vllm: true
+vllm_device: auto
+# some how the estimate cannot detect weights
+vllm_gpu_memory_utilization: 0.5 
+vllm_max_num_seqs: 50
+temperature: 0.5
+do_eval: true
+eval_strategy: steps
+eval_steps: 100
+save_strategy: steps
+save_steps: 100
+save_total_limit: 3
+
+# maybe this will change
+greater_is_better: True
+metric_for_best_model: accuracy
+
+# KL coef
+beta: 0.001
+
+gradient_accumulation_steps: 16
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+reward_funcs:
+- accuracy
+
+learning_rate: 1.0e-06
+log_level: info
+logging_steps: 1
+logging_strategy: steps
+lr_scheduler_type: constant
+warmup_ratio: 0
+max_prompt_length: 256
+max_completion_length: 1024
+# num_generations: 5
+# reduce this first
+num_generations: 5
+max_steps: -1
+num_train_epochs: 1
+output_dir: data/bamba
+overwrite_output_dir: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+push_to_hub: false
+# report_to:
+# #- wandb
+# - console
+seed: 42

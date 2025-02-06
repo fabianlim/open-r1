@@ -180,7 +180,9 @@ def main(script_args, training_args, model_args):
     #############################
     processing_class = None
     from transformers import AutoTokenizer, AutoConfig
-    tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, padding_side='left'
+    )
     config = AutoConfig.from_pretrained(model_args.model_name_or_path)
     for token_prefix in ['eos', 'pad']:
         _token_id_name = f'{token_prefix}_token_id'
@@ -188,6 +190,13 @@ def main(script_args, training_args, model_args):
             _id = getattr(config, _token_id_name)
             setattr(tokenizer, _token_id_name, _id) 
             processing_class = tokenizer
+
+    # HACK
+    # tokenizer.pad_token = config.eos_token
+    processing_class = tokenizer
+    processing_class.pad_token_id = 0
+    # somehow for bamba.. the model will generate a pad token at end of each utterance
+    processing_class.eos_token_id = processing_class.pad_token_id
 
     #############################
     # Initialize the GRPO trainer

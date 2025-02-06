@@ -61,6 +61,9 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
     """
     target = ground_truth['target']
     numbers = ground_truth['numbers']
+
+    # FIXME: break off the stop string
+    solution_str = solution_str.split("\nUser:")[0]
     
     equation = extract_solution(solution_str=solution_str)
     do_print = False # random.randint(1, 64) == 1
