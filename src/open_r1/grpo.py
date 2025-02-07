@@ -186,17 +186,16 @@ def main(script_args, training_args, model_args):
     config = AutoConfig.from_pretrained(model_args.model_name_or_path)
     for token_prefix in ['eos', 'pad']:
         _token_id_name = f'{token_prefix}_token_id'
-        if not hasattr(tokenizer, _token_id_name):
-            _id = getattr(config, _token_id_name)
+        _id = getattr(config, _token_id_name, None)
+        if (
+            getattr(tokenizer, _token_id_name, None) is None
+            and 
+            _id is not None
+        ):
+            # if tokenizer does not have it, but model_config does
+            # then transfer it 
             setattr(tokenizer, _token_id_name, _id) 
             processing_class = tokenizer
-
-    # HACK
-    # tokenizer.pad_token = config.eos_token
-    processing_class = tokenizer
-    processing_class.pad_token_id = 0
-    # somehow for bamba.. the model will generate a pad token at end of each utterance
-    processing_class.eos_token_id = processing_class.pad_token_id
 
     #############################
     # Initialize the GRPO trainer
@@ -211,6 +210,34 @@ def main(script_args, training_args, model_args):
         processing_class=processing_class,
         callbacks=get_callbacks(training_args, model_args),
     )
+
+    # add as many words to help the models to stop
+    # - with new custom tasks might want to update this list
+    # - ensure that these words are specific enough so as not to 
+    #   affect the custom tasks
+    has_sampling_params = hasattr(trainer, "sampling_params")
+    if has_sampling_params:
+        trainer.sampling_params.stop.extend([
+            "\nUser:"
+        ])
+
+    # adjustments for specific models
+    if config.model_type == 'bamba':
+
+        # for bamba we must use the tokenizer as the processing class
+        if processing_class is None:
+            processing_class = tokenizer
+
+        # this model has no pad token set in the tokenizer, so we set it
+        # processing_class.pad_token_id = 
+        # somehow for bamba.. the model will generate a pad token at end of each utterance
+        # processing_class.eos_token_id = processing_class.pad_token_id
+
+        # for bamba we notice that sometimes it uses a pad token to stop
+        if has_sampling_params:
+            trainer.sampling_params.stop_token_ids.extend([
+                processing_class.pad_token_id, processing_class.eos_token_id  
+            ])
 
     ###############
     # Training loop
