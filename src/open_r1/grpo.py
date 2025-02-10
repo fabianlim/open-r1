@@ -181,9 +181,13 @@ def main(script_args, training_args, model_args):
     processing_class = None
     from transformers import AutoTokenizer, AutoConfig
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side='left'
+        model_args.model_name_or_path, padding_side='left', 
+        trust_remote_code=training_args.model_init_kwargs.get("trust_remote_code", False)
     )
-    config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=training_args.model_init_kwargs.get("trust_remote_code", False)
+    )
     for token_prefix in ['eos', 'pad']:
         _token_id_name = f'{token_prefix}_token_id'
         _id = getattr(config, _token_id_name, None)
