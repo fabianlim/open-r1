@@ -3,11 +3,12 @@ import random
 import ast
 import operator
 from datasets import load_dataset as load_dataset_old, DatasetDict
+import torch
 
 # taken from TinyZero
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
-    solution_str = solution_str.split('\n')[-1]
+    solution_str = solution_str.strip()
 
     answer_pattern = r'<answer>(.*?)</answer>'
     match = re.finditer(answer_pattern, solution_str)
@@ -66,7 +67,16 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
     solution_str = solution_str.split("\nUser:")[0]
     
     equation = extract_solution(solution_str=solution_str)
-    do_print = False # random.randint(1, 64) == 1
+
+    do_print = False
+    if (
+        not torch.distributed.is_initialized() or 
+        (
+            torch.distributed.is_initialized() and
+            torch.distributed.get_rank() == 0
+        )
+    ):
+        do_print = random.randint(1, 64) == 1
     
     if do_print:
         print(f"--------------------------------")

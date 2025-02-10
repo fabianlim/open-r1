@@ -220,13 +220,6 @@ def main(script_args, training_args, model_args):
     # - ensure that these words are specific enough so as not to 
     #   affect the custom tasks
     has_sampling_params = hasattr(trainer, "sampling_params")
-    # FIXME: need to revert this as its causing grad norm explosion
-    # - while this is effective and reducing the completions, it is 
-    #   not accurate with the completion mask (as this is only checked with eos)
-    # if has_sampling_params:
-    #     trainer.sampling_params.stop.extend([
-    #         "\nUser:"
-    #     ])
 
     # adjustments for specific models
     if config.model_type == 'bamba':
@@ -238,11 +231,10 @@ def main(script_args, training_args, model_args):
 
         # for bamba we notice that sometimes it uses a pad token to stop
         # so we just force the eos to equal pad
-        # if has_sampling_params:
-        #     trainer.sampling_params.stop_token_ids.extend([
-        #         processing_class.pad_token_id, processing_class.eos_token_id  
-        #     ])
-        processing_class.eos_token_id = processing_class.pad_token_id
+        if has_sampling_params:
+            trainer.sampling_params.temperature = 0.01
+            trainer.sampling_params.top_p = 0.9
+            trainer.sampling_params.presence_penalty = 1.5
 
     ###############
     # Training loop
