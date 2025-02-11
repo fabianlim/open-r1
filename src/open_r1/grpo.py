@@ -59,7 +59,11 @@ class GRPOScriptArguments(ScriptArguments):
 
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
-    contents = [completion[0]["content"] for completion in completions]
+
+    try:
+        contents = [completion[0]["content"] for completion in completions]
+    except TypeError:
+        contents = completions
     rewards = []
     for content, sol in zip(contents, solution):
         gold_parsed = parse(sol, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
@@ -97,7 +101,10 @@ def accuracy_reward(completions, solution, **kwargs):
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-    completion_contents = [completion[0]["content"] for completion in completions]
+    try:
+        completion_contents = [completion[0]["content"] for completion in completions]
+    except TypeError:
+        completion_contents = completions
     matches = [re.match(pattern, content) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
