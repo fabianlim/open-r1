@@ -27,6 +27,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from open_r1.configs import GRPOConfig
 from open_r1.utils.callbacks import get_callbacks
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+import math
 
 try:
     from latex2sympy2_extended import NormalizationConfig
@@ -54,6 +55,36 @@ class GRPOScriptArguments(ScriptArguments):
     custom_task: str = field(
         default=None,
         metadata={"help": "Pass name to custom task"}
+    )
+
+    cosine_min_value_wrong: float = field(
+        default=0.0,
+        metadata={"help": "Minimum reward for wrong answers"},
+    )
+    cosine_max_value_wrong: float = field(
+        default=-0.5,
+        metadata={"help": "Maximum reward for wrong answers"},
+    )
+    cosine_min_value_correct: float = field(
+        default=0.5,
+        metadata={"help": "Minimum reward for correct answers"},
+    )
+    cosine_max_value_correct: float = field(
+        default=1.0,
+        metadata={"help": "Maximum reward for correct answers"},
+    )
+    cosine_max_len: int = field(
+        default=1000,
+        metadata={"help": "Maximum length for scaling"},
+    )
+
+    repetition_n_grams: int = field(
+        default=3,
+        metadata={"help": "Number of n-grams for repetition penalty reward"},
+    )
+    repetition_max_penalty: float = field(
+        default=-1.0,
+        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
 
 
@@ -100,19 +131,165 @@ def accuracy_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
     try:
         completion_contents = [completion[0]["content"] for completion in completions]
     except TypeError:
         completion_contents = completions
-    matches = [re.match(pattern, content) for content in completion_contents]
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 
-reward_funcs_registry = {
-    "accuracy": accuracy_reward,
-    "format": format_reward,
-}
+def reasoning_steps_reward(completions, **kwargs):
+    r"""Reward function that checks for clear step-by-step reasoning.
+    Regex pattern:
+        Step \d+: - matches "Step 1:", "Step 2:", etc.
+        ^\d+\. - matches numbered lists like "1.", "2.", etc. at start of line
+        \n- - matches bullet points with hyphens
+        \n\* - matches bullet points with asterisks
+        First,|Second,|Next,|Finally, - matches transition words
+    """
+    pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
+    try:
+        completion_contents = [completion[0]["content"] for completion in completions]
+    except TypeError:
+        completion_contents = completions
+    matches = [len(re.findall(pattern, content)) for content in completion_contents]
+
+    # Magic nubmer 3 to encourage 3 steps and more, otherwise partial reward
+    return [min(1.0, count / 3) for count in matches]
+
+
+def get_cosine_scaled_reward(
+    min_value_wrong: float = -1.0,
+    max_value_wrong: float = -0.5,
+    min_value_correct: float = 0.5,
+    max_value_correct: float = 1.0,
+    max_len: int = 1000,
+):
+    def cosine_scaled_reward(completions, solution, **kwargs):
+        """Reward function that scales based on completion length using a cosine schedule.
+
+        Shorter correct solutions are rewarded more than longer ones.
+        Longer incorrect solutions are penalized less than shorter ones.
+
+        Args:
+            completions: List of model completions
+            solution: List of ground truth solutions
+
+        This function is parameterized by the following arguments:
+            min_value_wrong: Minimum reward for wrong answers
+            max_value_wrong: Maximum reward for wrong answers
+            min_value_correct: Minimum reward for correct answers
+            max_value_correct: Maximum reward for correct answers
+            max_len: Maximum length for scaling
+        """
+        try:
+            contents = [completion[0]["content"] for completion in completions]
+        except TypeError:
+            contents = completions
+        rewards = []
+
+        for content, sol in zip(contents, solution):
+            gold_parsed = parse(sol, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
+            if len(gold_parsed) == 0:
+                rewards.append(1.0)  # Skip unparseable examples
+                print("Failed to parse gold solution: ", sol)
+                continue
+
+            answer_parsed = parse(
+                content,
+                extraction_config=[
+                    LatexExtractionConfig(
+                        normalization_config=NormalizationConfig(
+                            nits=False,
+                            malformed_operators=False,
+                            basic_latex=True,
+                            equations=True,
+                            boxed=True,
+                            units=True,
+                        ),
+                        boxed_match_priority=0,
+                        try_extract_without_anchor=False,
+                    )
+                ],
+                extraction_mode="first_match",
+            )
+
+            is_correct = verify(answer_parsed, gold_parsed)
+            gen_len = len(content)
+
+            # Apply cosine scaling based on length
+            progress = gen_len / max_len
+            cosine = math.cos(progress * math.pi)
+
+            if is_correct:
+                min_value = min_value_correct
+                max_value = max_value_correct
+            else:
+                # Swap min/max for incorrect answers
+                min_value = max_value_wrong
+                max_value = min_value_wrong
+
+            reward = min_value + 0.5 * (max_value - min_value) * (1.0 + cosine)
+            rewards.append(float(reward))
+
+        return rewards
+
+    return cosine_scaled_reward
+
+
+def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
+    """
+    Computes N-gram repetition penalty as described in Appendix C.2 of https://arxiv.org/abs/2502.03373.
+    Reference implementation from: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
+
+    Args:
+    ngram_size: size of the n-grams
+    max_penalty: Maximum (negative) penalty for wrong answers
+    """
+    if max_penalty > 0:
+        raise ValueError(f"max_penalty {max_penalty} should not be positive")
+
+    def zipngram(text: str, ngram_size: int):
+        words = text.lower().split()
+        return zip(*[words[i:] for i in range(ngram_size)])
+
+    def repetition_penalty_reward(completions, **kwargs) -> float:
+        """
+        reward function the penalizes repetitions
+        ref implementation: https://github.com/eddycmu/demystify-long-cot/blob/release/openrlhf/openrlhf/reward/repetition.py
+
+        Args:
+            completions: List of model completions
+        """
+
+        try:
+            contents = [completion[0]["content"] for completion in completions]
+        except TypeError:
+            contents = completions
+        rewards = []
+        for completion in contents:
+            if completion == "":
+                rewards.append(0.0)
+                continue
+            if len(completion.split()) < ngram_size:
+                rewards.append(0.0)
+                continue
+
+            ngrams = set()
+            total = 0
+            for ng in zipngram(completion, ngram_size):
+                ngrams.add(ng)
+                total += 1
+
+            scaling = 1 - len(ngrams) / total
+            reward = scaling * max_penalty
+            rewards.append(reward)
+        return rewards
+
+    return repetition_penalty_reward
+
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
@@ -149,6 +326,24 @@ def main(script_args, training_args, model_args):
     logger.info(f"Script parameters {script_args}")
     logger.info(f"Data parameters {training_args}")
 
+    REWARD_FUNCS_REGISTRY = {
+        "accuracy": accuracy_reward,
+        "format": format_reward,
+        "reasoning_steps": reasoning_steps_reward,
+        "cosine": get_cosine_scaled_reward(
+            min_value_wrong=script_args.cosine_min_value_wrong,
+            max_value_wrong=script_args.cosine_max_value_wrong,
+            min_value_correct=script_args.cosine_min_value_correct,
+            max_value_correct=script_args.cosine_max_value_correct,
+            max_len=script_args.cosine_max_len,
+        ),
+        "repetition_penalty": get_repetition_penalty_reward(
+            ngram_size=script_args.repetition_n_grams,
+            max_penalty=script_args.repetition_max_penalty,
+        ),
+    }
+    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+
     # Check for last checkpoint
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir):
@@ -161,9 +356,12 @@ def main(script_args, training_args, model_args):
         custom_task = getattr(tasks, script_args.custom_task)
         dataset = custom_task.load_dataset(script_args.dataset_name, name=script_args.dataset_config)
         dataset = dataset.map(custom_task.make_conversation)
-        reward_funcs = [
-            custom_task.reward_funcs_registry[func] for func in script_args.reward_funcs
-        ]
+        try:
+            reward_funcs = [
+                custom_task.reward_funcs_registry[func] for func in script_args.reward_funcs
+            ]
+        except:
+            print ("using standard rewards")
     else:
         # Format into conversation
         def make_conversation(example):
@@ -176,7 +374,6 @@ def main(script_args, training_args, model_args):
         # Load the dataset
         dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
         dataset = dataset.map(make_conversation)
-        reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
 
     for split in dataset:
         if "messages" in dataset[split].column_names:

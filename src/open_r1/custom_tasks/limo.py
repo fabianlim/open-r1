@@ -1,5 +1,5 @@
 from ..grpo import (
-    reward_funcs_registry, SYSTEM_PROMPT
+    SYSTEM_PROMPT
 )
 from datasets import load_dataset
 
