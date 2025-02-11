@@ -93,7 +93,7 @@ def accuracy_reward(completions, solution, **kwargs):
 
     try:
         contents = [completion[0]["content"] for completion in completions]
-    except TypeError:
+    except:
         contents = completions
     rewards = []
     for content, sol in zip(contents, solution):
@@ -133,7 +133,7 @@ def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
     try:
         completion_contents = [completion[0]["content"] for completion in completions]
-    except TypeError:
+    except:
         completion_contents = completions
     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
@@ -152,7 +152,7 @@ def reasoning_steps_reward(completions, **kwargs):
     pattern = r"(Step \d+:|^\d+\.|\n-|\n\*|First,|Second,|Next,|Finally,)"
     try:
         completion_contents = [completion[0]["content"] for completion in completions]
-    except TypeError:
+    except:
         completion_contents = completions
     matches = [len(re.findall(pattern, content)) for content in completion_contents]
 
@@ -186,7 +186,7 @@ def get_cosine_scaled_reward(
         """
         try:
             contents = [completion[0]["content"] for completion in completions]
-        except TypeError:
+        except:
             contents = completions
         rewards = []
 
@@ -266,7 +266,7 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
 
         try:
             contents = [completion[0]["content"] for completion in completions]
-        except TypeError:
+        except:
             contents = completions
         rewards = []
         for completion in contents:
