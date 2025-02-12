@@ -342,7 +342,6 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
     }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Check for last checkpoint
     last_checkpoint = None
@@ -357,9 +356,7 @@ def main(script_args, training_args, model_args):
         dataset = custom_task.load_dataset(script_args.dataset_name, name=script_args.dataset_config)
         dataset = dataset.map(custom_task.make_conversation)
         try:
-            reward_funcs = [
-                custom_task.reward_funcs_registry[func] for func in script_args.reward_funcs
-            ]
+            custom_task.update_reward_funcs(REWARD_FUNCS_REGISTRY, script_args)
         except:
             print ("using standard rewards")
     else:
@@ -374,6 +371,8 @@ def main(script_args, training_args, model_args):
         # Load the dataset
         dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
         dataset = dataset.map(make_conversation)
+
+    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     for split in dataset:
         if "messages" in dataset[split].column_names:
