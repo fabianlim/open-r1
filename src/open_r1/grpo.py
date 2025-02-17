@@ -108,8 +108,8 @@ class GRPOScriptArguments(ScriptArguments):
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+    "process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., "
+    "<think> reasoning process here </think> \\boxed{answer here}."
 )
 
 
@@ -187,6 +187,17 @@ def main(script_args, training_args, model_args):
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
+
+    #############################
+    # Update the tokenizer 
+    #############################
+    processing_class = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, padding_side="left",
+        trust_remote_code=training_args.model_init_kwargs
+.get("trust_remote_code", False)
+    )
+    # add this to better prompt the think 
+    processing_class.chat_template = processing_class.chat_template + 'Let me solve this step by step.\n<think>'
 
     #############################
     # Initialize the GRPO trainer
