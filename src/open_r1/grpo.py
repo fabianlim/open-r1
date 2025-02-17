@@ -21,7 +21,7 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import set_seed
+from transformers import set_seed, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig
@@ -208,6 +208,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        processing_class=processing_class,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
     )
