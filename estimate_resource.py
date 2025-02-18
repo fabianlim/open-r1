@@ -2,8 +2,18 @@ from datasets import load_dataset, Dataset
 from dataclasses import dataclass, field
 from trl import ScriptArguments, TrlParser
 from trl.data_utils import apply_chat_template
-from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForSeq2Seq
+from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorWithPadding
 from accelerate import Accelerator
+from trl.trainer.utils import selective_log_softmax
+
+import datetime
+
+# verify we have FSDP activation support ready by importing:
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
 
 import os
 
@@ -19,9 +29,9 @@ import time, json
 from tqdm import trange
 import numpy as np
 
-DATASET_FILE = 'dataset.json'
-METRICS_VLLM_FILE = 'metrics_vllm.json'
-METRICS_TRAIN_FILE = 'metrics_train.json'
+DATASET_FILE = 'dataset-{}-{}.json'
+METRICS_VLLM_FILE = 'metrics_vllm-{}.json'
+METRICS_TRAIN_FILE = 'metrics_train-{}.json'
 
 @dataclass
 class Arguments(ScriptArguments):
@@ -73,7 +83,7 @@ def estimate_vllm(
         model=model, 
         device=f'cuda', 
         dtype=dtype, 
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=0.95,
         max_num_seqs=max_num_seqs,
         hf_overrides = {
             'max_position_embeddings': prefix_length + generation_length
@@ -88,6 +98,7 @@ def estimate_vllm(
     # at a time
     # https://github.com/huggingface/trl/pull/2776
 
+    T = time.time()
     raw_output = llm.generate(
         [eg['prompt'] for eg in dataset.select(range(num_devices))], 
         SamplingParams(
@@ -96,6 +107,7 @@ def estimate_vllm(
             temperature=1,
         )
     )
+    time_elapsed = time.time() - T
 
     examples = Dataset.from_list([
         {"input_ids": prompt.prompt_token_ids + list(completion.token_ids)} 
@@ -103,10 +115,12 @@ def estimate_vllm(
         for completion in prompt.outputs
     ])
 
+    times = [out.metrics.finished_time - out.metrics.arrival_time 
+            for out in raw_output]
     metrics = {}
-    metrics['time_taken'] = sum(
-        [out.metrics.finished_time - out.metrics.arrival_time 
-             for out in raw_output]) 
+    metrics['time_taken_sum'] = sum(times)
+    metrics['time_taken_mean'] = sum(times) / len(times)
+    metrics['time_elapsed'] = time_elapsed
     metrics['model'] = model
     metrics['dtype'] = dtype
     metrics['max_num_seqs'] = max_num_seqs
@@ -132,8 +146,10 @@ def estimate_tune(
     use_flash_attn: bool = False,
     num_trials: int = 100,
 ):
+    tokenizer = AutoTokenizer.from_pretrained(model)
+
     # test flattening?
-    data_collator = DataCollatorForSeq2Seq()
+    data_collator = DataCollatorWithPadding(tokenizer)
 
     # TODO: handle GA?
     # gradient_accumulation_steps = math.ceil(
@@ -153,35 +169,91 @@ def estimate_tune(
     )
     model, dataloader = accelerator.prepare(model, dataloader)
 
+    # activation checkpointing
+    # NOTE: having some problems with no reentrant? check the loss
+    # https://github.com/lessw2020/transformer_central/blob/main/activation_checkpointing_tutorial/activation_checkpointing_tutorial.ipynb
+    from functools import partial
+    check_fn = lambda submodule: submodule.__class__.__name__ in model._no_split_modules
+    non_reentrant_wrapper = partial(
+        checkpoint_wrapper,
+        # offload_to_cpu=False,
+        checkpoint_impl=CheckpointImpl.REENTRANT,
+    )
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+    )
+
+    # NOTE: we are not making a seperate copy of the ref
+    # at this point
+    ref_model = model
+
     # but some bogus learning rate
     optimizer = AdamW(model.parameters(), lr=1e-6)
 
     optimizer = accelerator.prepare(optimizer)
+    
+    def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
+            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+            logits = model(
+                input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1
+            ).logits  # (B, L, V)
+            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
+            input_ids = input_ids[:, -logits_to_keep:]
+            # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+            # See https://github.com/huggingface/trl/issues/2770
+            logits = logits[:, -logits_to_keep:]
+
+            return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
     times_taken = []
     for _ in trange(num_trials, disable=not accelerator.is_main_process):
 
         # this simulates the GA
         T = time.time()
-        optimizer.zero()
+        optimizer.zero_grad()
+
+        loss = 0
         for batch in dataloader:
-        # for __ in range(gradient_accumulation_steps):
 
             # for reference
-            with torch.no_grad():
-                model(**batch)
+            # with torch.no_grad():
+            #     model(**batch)
+
+            # for the reference model
+            # TODO: we are not making a seperate copy
+            # of the reference model yet
+            # assume the prompt length is about 100
+            logits_to_keep = batch['input_ids'].size(1) - 100
+            per_token_logps = get_per_token_logps(
+                model, batch['input_ids'], None, logits_to_keep
+            )
+            with torch.inference_mode():
+                ref_per_token_logps = get_per_token_logps(
+                    ref_model, batch['input_ids'], None, logits_to_keep
+                )
+
+            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+            # skipped out the reward compute
+            # fake the loss
+            loss = loss + (
+                torch.exp(per_token_logps - per_token_logps.detach()) + 
+                per_token_kl
+            )
 
             # actual training
-            batch['labels'] = batch['input_ids']
-            loss = model(**batch)
-            loss.backward()
+            # batch['labels'] = batch['input_ids']
+            # loss = model(**batch)
+            # loss.backward()
 
+        loss.sum(axis=1).mean().backward()
         optimizer.step()
 
         # to simulate passing off the VLLM
         # we dont measure the VLLM model loading times here
         torch.cuda.synchronize()
-        T = time.tim() - T
+        T = time.time() - T
         times_taken.append(T)
 
     return times_taken
@@ -189,13 +261,23 @@ def estimate_tune(
 if __name__ == "__main__":
 
     parser = TrlParser(Arguments)
-    script_args = parser.parse_args_and_config()
+    script_args, = parser.parse_args_and_config()
 
     dataset = load_dataset(script_args.dataset_name, split='train')
 
+    try:
+        os.makedirs(script_args.results_dir)
+    except FileExistsError:
+        pass
+
     accelerator = Accelerator()
+    timestamp = str(datetime.datetime.now()).replace(' ', '-')
 
     train_dataset_path = os.path.join(script_args.results_dir, DATASET_FILE)
+    train_dataset_path = train_dataset_path.format(
+        script_args.num_devices,
+        script_args.num_generations,
+    )
     if script_args.run_vllm and accelerator.is_main_process: 
 
         train_dataset, vllm_metrics = estimate_vllm(
@@ -207,23 +289,24 @@ if __name__ == "__main__":
         )
         train_dataset.to_json(train_dataset_path)
 
-        with open(os.path.join(script_args.results_dir, METRICS_TRAIN_FILE)) as f:
-            json.dump(vllm_metrics)
-    else:
-        train_dataset = Dataset.from_json(train_dataset_path, split='train')
+        with open(os.path.join(script_args.results_dir, METRICS_VLLM_FILE.format(timestamp)), 'w') as f:
+            json.dump(vllm_metrics, f)
 
     # bench training
-
     if script_args.run_training:
+
+        train_dataset = Dataset.from_json(train_dataset_path, split='train')
+
         times_taken = estimate_tune(
             script_args.model_name,
             train_dataset,
+            accelerator,
             train_batch_size=script_args.train_batch_size,
             use_flash_attn=script_args.use_flash_attn,
         )
 
         if accelerator.is_main_process:
-            with open(os.path.join(script_args.results_dir, METRICS_TRAIN_FILE)) as f:
+            with open(os.path.join(script_args.results_dir, METRICS_TRAIN_FILE.format(timestamp)), 'w') as f:
                 json.dump({
                     'model_name': script_args.model_name,
                     'dataset_name': script_args.dataset_name,
