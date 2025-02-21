@@ -131,10 +131,12 @@ class VLLMDeviceManager:
             [tensors[i].shape[-1] for i in range(len(tensors))],
             dtype=torch.int32, device=self.device
         )
-        self._group_barrier()
 
         # get a single tensor
+        self._group_barrier()
         gathered_sizes = self.gather(sizes)
+
+        # for all_gather
         output_objects = [
             torch.empty(
                 gathered_sizes[i*batch:(i+1)*batch].sum(),
@@ -143,9 +145,9 @@ class VLLMDeviceManager:
             for i in range(self.mini_shard_size)
         ]
 
-        self._group_barrier()
         # have to use gather because we cannot gaurantee
         # all tensors are of equal length
+        self._group_barrier()
         torch.distributed.all_gather(
             output_objects,
             torch.cat(tensors), # form batch into single tensor
@@ -158,10 +160,94 @@ class VLLMDeviceManager:
 
         outputs = []
         for i in range(self.mini_shard_size):
-            batch_sizes = gathered_sizes[i*batch:(i+1)*batch].detach().tolist()
+            batch_sizes = gathered_sizes[i*batch:(i+1)*batch].tolist()
             outputs.extend(torch.split(
                 output_objects[i], batch_sizes,
             ))
+        return outputs
+
+    def scatter_tensor_list(
+        self, 
+        batch: int,
+        dtype,
+        tensors: List[torch.tensor] = None,
+    ):
+
+        # assume all the ranks give the same batch size
+
+        if tensors is not None:
+            assert len(tensors) > 0, "cannot scatter empty tensor list"
+            assert self.is_shard_leader, "only the shard leader can scatte"
+
+            # assume the tensors are 1-D
+            sizes = torch.tensor(
+                [tensors[i].shape[-1] for i in range(len(tensors))],
+                dtype=torch.int32, device=self.device
+            )
+        else:
+
+            # need to broadcast the sizes
+            sizes = torch.empty(
+                batch * self.mini_shard_size, 
+                dtype=torch.int32, device=self.device
+            )
+
+        # get all the sizes
+        self._group_barrier()
+        torch.distributed.broadcast(
+            sizes,
+            group=self._group, 
+            src=self.global_rank_shard_leader,
+        )
+
+        # total number of tokens in one mini shard
+        scattered_sizes_list = sizes.view(-1, batch).sum(axis=-1)
+
+        # largest number of tokens in one rank of the mini shard
+        max_size = scattered_sizes_list.max().item()
+
+        # scatter tensor
+        scattered_tensor = torch.empty(
+            # scattered_sizes.sum(),
+            max_size,
+            dtype=dtype, device=self.device
+        )
+
+        # each rank will get a cat of its batch
+        scattered_tensor_list = None
+        if self.is_shard_leader:
+            scattered_tensor_list = []
+            for i in range(self.mini_shard_size):
+
+                # collect all the tokens in the batch
+                # of a rank in the minishard
+                ids = []
+                for j in range(batch):
+                    ids.extend(tensors[i*batch+j])
+
+                # pad it to make all same rank
+                ids.extend([0] * (max_size - len(ids)))
+                scattered_tensor_list.append(
+                    torch.tensor(ids, dtype=dtype, device=self.device)
+                )
+
+        # get max_size tokens of the rank
+        self._group_barrier()
+        torch.distributed.scatter(
+            scattered_tensor, scattered_tensor_list,
+            group=self._group, 
+            src=self.global_rank_shard_leader,
+        )
+
+        # get the number of tokens in this rank
+        r = self.local_rank_mini_shard
+        szs_sum = scattered_sizes_list[r]
+        szs = sizes[r*batch:(r+1)*batch].tolist()
+
+        # drop the padding and split
+        outputs = torch.split(
+            scattered_tensor[:szs_sum], szs
+        )
         return outputs
 
 if __name__ == '__main__':
@@ -201,7 +287,7 @@ if __name__ == '__main__':
         for i in range(world_size // mini_shard_size)
     ]
 
-    for _ in trange(1):
+    for _ in trange(100):
 
         input_ids = [
             torch.tensor(ids, dtype=torch.int32, device=device)
@@ -211,7 +297,6 @@ if __name__ == '__main__':
         # only the min_shard leader will get stuff
         gathered_ids = manager.gather_tensor_list(input_ids)
 
-        torch.distributed.breakpoint(3)
         if manager.is_vllm_process:
             mini_shard_index = rank // mini_shard_size
             assert (
@@ -219,6 +304,18 @@ if __name__ == '__main__':
                 ==
                 sum([ids.sum() for ids in gathered_ids])
             )
+
+        # scatter back
+        scattered_ids = manager.scatter_tensor_list(
+            len(input_ids), input_ids[0].dtype,
+            gathered_ids, 
+        )
+
+        assert (
+            sum([len(x) for x in TOKEN_IDS[rank]]) 
+            ==
+            sum([len(x) for x in scattered_ids])
+        )
 
         sleep(1)
 
