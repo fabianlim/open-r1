@@ -31,12 +31,15 @@ fsdp_config:
                             # 3 is NO_SHARD, effectively disabling FSDP
                             # 4, 5 are HYBRID_ modes for multi-node training only.
 
-  fsdp_state_dict_type: FULL_STATE_DICT # set to FULL_STATE_DICT (1), SHARDED_STATE_DICT (3)
+  fsdp_state_dict_type: SHARDED_STATE_DICT # set to FULL_STATE_DICT (1), SHARDED_STATE_DICT (3)
                                         # 2 is LOCAL_STATE_DICT where parameters are still flattened
                                         # 3 is efficient, but requires know-how to use the shared checkpoint.
  
   fsdp_cpu_ram_efficient_loading: true # for large models set to true, model loaded on single process
   fsdp_sync_module_states: true # for large models set to true, model loaded on single process
+
+  fsdp_activation_checkpointing: true # better to use the FSDP version
+  fsdp_use_orig_params: false # accelerate seems to set this to True by default now
 
   # not needed for HF models that have . _no_split_modules
   # the example below is for GPTBigCode
