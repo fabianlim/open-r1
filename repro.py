@@ -19,16 +19,43 @@ from vllm import LLM, SamplingParams
 # TRANSFORMERS_VERBOSITY=error ACCELERATE_LOG_LEVEL=info accelerate launch \
 #    --num_processes 4 repro.py
 
-# printouts
+# before running: do pip install transformers accelerate vllm
+
+# - tested on versions
+# transformers==4.49.0
+# torch==2.5.1
+# vllm==0.7.3
+# accelerate==1.4.0
+
+# for this demo we use a small model for the model under train. 
+# - but typically this woul be the same model loaded into VLLM
+
+# EXPECTED PRINTOUTS
+# - if shard_train_model = True we will see this. 
+# - the strange characters caused by NaN's coming from TP reduce
 # text (0):  We can visualize the spheres with radii 11, 13, and 19
 # text (1): !!!!!!!!!!!!!!!!!!!!
 # text (2): !!!!!!!!!!!!!!!!!!!!
 # text (3): !!!!!!!!!!!!!!!!!!!!
 
+# - if shard_train_model = False we will see this:
+# text (0):  We can visualize the spheres with radii 11, 13, and 19
+# text (1):  First, let's denote $c = \log_{2^b}(2^{100
+# text (2): First, we need to find the dimensions of the rhombus. A key property of the rh
+# text (3): First, I’ll start by simplifying the given equation. We are given the equation: $\sqrt
+
+# Motivation: for RLHF, we want to collocate vllm with training. 
+# - for vllm collocation, we should be deploying with external_launcher.
+# - for training, frameworks for sharding models like FSDP and DeepSpeed are commonplace. We 
+#   expect that we should be able to train with vllm running in the same process.
+# - however here we are presented with a situation, where if we try to shard the model with
+#   a standard library used for this purpose (FSDP), we are seeing incorrect outputs from vllm
+
 def main(
     model_name = 'Qwen/Qwen2.5-Math-72B',
-    model_in_train_name = 'facebook/opt-1.3b', # use a small model for demo
+    model_under_train_name = 'facebook/opt-1.3b', # use a small model for demo
     gpu_memory_utilization = 0.5,
+    shard_train_model = True, 
 ):
 
     # Enviromnent variables
@@ -58,38 +85,41 @@ def main(
     )
 
     # training model
-    if model_in_train_name is not None:
-        tokenizer = AutoTokenizer.from_pretrained(model_in_train_name)
+    if model_under_train_name is not None:
+        tokenizer = AutoTokenizer.from_pretrained(model_under_train_name)
         model = AutoModelForCausalLM.from_pretrained(
-            model_in_train_name, 
+            model_under_train_name, 
             torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
+            device_map={'': 'cuda' if not shard_train_model else 'cpu'}
         )
         model.gradient_checkpointing_enable({"use_reentrant": False})
-        from torch.distributed.fsdp.fully_sharded_data_parallel import (
-            FullyShardedDataParallel as FSDP,
-            ShardingStrategy,
-        )
-        from functools import partial
-        from accelerate.utils.dataclasses import get_module_class_from_name
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-        transformer_cls_to_wrap = set()
-        for layer_class in model._get_no_split_modules('cuda'):
-            transformer_cls = get_module_class_from_name(model, layer_class)
-            transformer_cls_to_wrap.add(transformer_cls)
+        if shard_train_model:
+            # standard way of sharding a model under train
+            from torch.distributed.fsdp.fully_sharded_data_parallel import (
+                FullyShardedDataParallel as FSDP,
+                ShardingStrategy,
+            )
+            from functools import partial
+            from accelerate.utils.dataclasses import get_module_class_from_name
+            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-        model = FSDP(
-            model, 
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy=partial(
-                transformer_auto_wrap_policy, 
-                transformer_layer_cls=transformer_cls_to_wrap,
-            ),
-            sync_module_states=True,
-            param_init_fn=lambda x: x.to_empty(device=device, recurse=False),
-            device_id=device,
-        )
+            transformer_cls_to_wrap = set()
+            for layer_class in model._get_no_split_modules('cuda'):
+                transformer_cls = get_module_class_from_name(model, layer_class)
+                transformer_cls_to_wrap.add(transformer_cls)
+
+            # - fully sharded data parallel from Meta
+            model = FSDP(
+                model, 
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                auto_wrap_policy=partial(
+                    transformer_auto_wrap_policy, 
+                    transformer_layer_cls=transformer_cls_to_wrap,
+                ),
+                device_id=device,
+                process_group=torch.distributed.new_group(range(world_size), backend='nccl')
+            )
 
         if local_rank == 0:
             print (model)
@@ -100,7 +130,6 @@ def main(
             sampling_params=sampling_params, 
             use_tqdm=False,
         )
-        # torch.distributed.breakpoint()
         output = outputs[0]
         text = output.outputs[0].text
 
@@ -110,7 +139,7 @@ def main(
         )
         if local_rank == 0:
             print (f"text ({i}):", text)
-        if model_in_train_name:
+        if model_under_train_name:
             out = model(input_ids, labels=input_ids.long())
             loss = out.loss
             loss.backward()
