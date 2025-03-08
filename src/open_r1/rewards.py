@@ -262,7 +262,9 @@ def get_cosine_scaled_reward(
 
             # Apply cosine scaling based on length
             progress = gen_len / max_len
-            cosine = math.cos(progress * math.pi)
+            # cosine = math.cos(progress * math.pi)
+            # NOTE: change to sin but dont bother renaming function
+            sine = math.sin(min(progress, 1) * math.pi / 2)
 
             if is_correct:
                 min_value = min_value_correct
@@ -272,7 +274,7 @@ def get_cosine_scaled_reward(
                 min_value = max_value_wrong
                 max_value = min_value_wrong
 
-            reward = min_value + 0.5 * (max_value - min_value) * (1.0 + cosine)
+            reward = min_value + (max_value - min_value) * sine
             rewards.append(float(reward))
 
         return rewards
