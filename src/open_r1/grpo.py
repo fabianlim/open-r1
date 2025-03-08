@@ -21,7 +21,7 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import set_seed
+from transformers import set_seed, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig
@@ -97,12 +97,19 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
 
+    user_content_field: str = field(
+        default="problem",
+        metadata={"help": "example field for extracting user content"},
+    )
+
+
+
 
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+    "process is enclosed within <think> </think> and the answer is given in the \\boxed environment, respectively, i.e., "
+    "<think> reasoning process here </think> \\boxed{answer here}."
 )
 
 
@@ -172,7 +179,7 @@ def main(script_args, training_args, model_args):
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
+                {"role": "user", "content": example[script_args.user_content_field]},
             ],
         }
 
@@ -181,18 +188,16 @@ def main(script_args, training_args, model_args):
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
-    logger.info("*** Initializing model kwargs ***")
-    torch_dtype = (
-        model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    #############################
+    # Update the tokenizer 
+    #############################
+    processing_class = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path, padding_side="left",
+        trust_remote_code=training_args.model_init_kwargs
+.get("trust_remote_code", False)
     )
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-        attn_implementation=model_args.attn_implementation,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-    )
-    training_args.model_init_kwargs = model_kwargs
+    # add this to better prompt the think 
+    processing_class.chat_template = processing_class.chat_template + 'Let me solve this step by step.\n<think>'
 
     #############################
     # Initialize the GRPO trainer
@@ -203,6 +208,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        processing_class=processing_class,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
     )
