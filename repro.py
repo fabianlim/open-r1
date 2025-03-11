@@ -44,6 +44,12 @@ from vllm import LLM, SamplingParams
 # text (2): First, we need to find the dimensions of the rhombus. A key property of the rh
 # text (3): First, I’ll start by simplifying the given equation. We are given the equation: $\sqrt
 
+# -if shard_train_model == "v2" it works though:
+# text (0):  We can visualize the spheres with radii 11, 13, and 19
+# text (1):  First, let's denote $c = \log_{2^b}(2^{100
+# text (2): First, we need to find the dimensions of the rhombus. A key property of the rh
+# text (3): First, I’ll start by simplifying the given equation. We are given the equation: $\sqrt
+
 # Motivation: for RLHF, we want to collocate vllm with training. 
 # - for vllm collocation, we should be deploying with external_launcher.
 # - for training, frameworks for sharding models like FSDP and DeepSpeed are commonplace. We 
@@ -94,7 +100,7 @@ def main(
         )
         model.gradient_checkpointing_enable({"use_reentrant": False})
 
-        if shard_train_model:
+        if shard_train_model is True:
             # standard way of sharding a model under train
             from torch.distributed.fsdp.fully_sharded_data_parallel import (
                 FullyShardedDataParallel as FSDP,
@@ -120,6 +126,26 @@ def main(
                 device_id=device,
                 process_group=torch.distributed.new_group(range(world_size), backend='nccl')
             )
+        elif shard_train_model == 'v2':
+            from torch.distributed import init_device_mesh
+            torch.cuda.set_device(device)
+            from torch.distributed._composable.fsdp import (
+                fully_shard, MixedPrecisionPolicy,
+            )
+            device_mesh = init_device_mesh(
+                'cuda', (world_size,), mesh_dim_names=('dp',)
+            )
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
+            )
+            fsdp_config = {"mesh": device_mesh, "mp_policy": mp_policy}
+            no_shard_modules = model._no_split_modules
+            for module in model.modules():
+                classname = module.__class__.__name__
+                if classname in no_shard_modules:
+                    fully_shard(module, **fsdp_config)
+
+            fully_shard(model, **fsdp_config)
 
         if local_rank == 0:
             print (model)
